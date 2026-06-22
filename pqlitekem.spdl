@@ -1,0 +1,226 @@
+/*
+ * pqlitekem.spdl  --  Scyther formal verification model for PQ-LiteKEM
+ *
+ * Protocol: PQ-LiteKEM (channel-agnostic post-quantum key establishment)
+ * Roles:    SN -- Constrained Sensor Node  (e.g. LilyGo T-Watch S3, BLE peripheral)
+ *           EG -- Edge Gateway             (e.g. Raspberry Pi, BLE central)
+ *
+ * Companion artifact to:
+ *   "Provably Secure Practical Lightweight Post-Quantum Key Establishment
+ *   Protocol for IoMT", CPSIoTSec '26.
+ *
+ * Division of labour with ProVerif (pqlitekem.pv, same repository)
+ * -------------------------------------------------------------------
+ * This model establishes entity authentication and term/message-order
+ * agreement (Alive, Weakagree, Niagree, Nisynch) under a STATIC Dolev-Yao
+ * adversary -- i.e. the adversary's capabilities do not change over the
+ * trace being checked. Scyther's claim language has no construct for
+ * granting the adversary a long-term secret only AFTER a session has
+ * closed, so it cannot by itself certify Perfect Forward Secrecy (PFS) or
+ * HNDL resistance. That separate, time-phased guarantee is established in
+ * the companion ProVerif model via an explicit `phase` compromise of
+ * K_psk and Q_SN. Read the `claim(..., Secret, ...)` results below as
+ * "secret under a non-compromised long-term key", not as a PFS proof.
+ *
+ * Modelling decisions
+ * --------------------
+ * 1. Long-term secrets: K_auth and K_psk (paper eq. 2/7) are two distinct
+ *    secrets related by a one-way KDF, not equal to one another. Scyther
+ *    only treats its literal built-in symbol `k(A,B)` as an implicit
+ *    secret shared between exactly A and B -- a custom symbol declared
+ *    via `function` is NOT automatically secret, and using one here would
+ *    hand the intruder a free long-term key as initial knowledge. Both
+ *    secrets are therefore modelled via the same trusted built-in
+ *    `k(A,B)` family, distinguished by swapping the agent argument order:
+ *        k(SN,EG)  -- stands in for K_auth (Phase-1 AEAD exchange)
+ *        k(EG,SN)  -- stands in for K_psk  (Phase-2 HMAC tags, sigma)
+ *    Scyther does not assume `k` is commutative, so these are two
+ *    genuinely distinct secrets, each implicitly known only to {SN,EG}.
+ *
+ * 2. ML-KEM-512 is modelled as asymmetric encryption: { ss }pk(SN)
+ *      Encapsulate(pk_SN) -> (ct, ss)   modelled as   { ss }pk(SN)
+ *      Decapsulate(sk_SN, ct) -> ss     modelled as   decryption of { ss }pk(SN)
+ *    This is the standard KEM-as-asymmetric-encryption abstraction under
+ *    the perfect cryptography assumption (paper Sec. 5.4.1).
+ *
+ *    LIMITATION: Scyther's pk()/sk() convention ties a keypair to an
+ *    agent's long-term identity, not to a fresh per-session value. The
+ *    real protocol generates (pk_SN, sk_SN) AFRESH every session
+ *    (paper Sec. 4.3) and erases sk_SN immediately after decapsulation,
+ *    which is exactly what gives PQ-LiteKEM forward secrecy -- but that
+ *    session-freshness is not representable in Scyther's fixed pk(SN)/
+ *    sk(SN) pair. This is a known, accepted simplification when modelling
+ *    ephemeral KEMs in Scyther; it is the reason PFS is verified
+ *    separately in ProVerif rather than claimed from this model.
+ *
+ * 3. AES-256-GCM is modelled as symmetric encryption: { m }k
+ *
+ * 4. HMAC-SHA3-256 is modelled as a keyed hash: mac(m, k)
+ *
+ * 5. HKDF-SHA3-256 session-key derivation (sigma, paper eq. 5/13) is
+ *    modelled as a keyed hash: h(ss, k(EG,SN), tEG)
+ */
+
+hashfunction h;
+hashfunction mac;
+
+protocol PQLiteKEM(SN, EG)
+{
+    /*
+     * Role SN -- Constrained Sensor Node (initiator)
+     *
+     * Phase 1a: sends M1 (auth request)
+     * Phase 1b: receives M2 (auth response), verifies
+     * Phase 2a: sends M3 (ephemeral ML-KEM-512 public key)
+     * Phase 2b: receives M4 (ML-KEM-512 ciphertext), decapsulates -> ss
+     * Phase 3:  derives sigma = h(ss, k(EG,SN), tEG)
+     * Phase 4:  sends M5 (encrypted sensor telemetry under sigma)
+     */
+    role SN
+    {
+        fresh nSN : Nonce;
+        fresh tSN : Nonce;
+        var   nEG : Nonce;
+        var   tEG : Nonce;
+        var   ss  : Nonce;
+
+        /*
+         * M1: T_SN || { T_SN, n_SN }_{K_auth}
+         * SN sends its nonce + canary timestamp encrypted under K_auth.
+         * T_SN also appears in clear (used as part of the GCM IV in the
+         * real protocol; paper eq. 9).
+         */
+        send_1( SN, EG,
+            tSN,
+            { tSN, nSN }k(SN,EG)
+        );
+
+        /*
+         * M2: T_EG || { T_EG, n_EG, n_SN }_{K_auth}
+         * EG responds with its own nonce + timestamp, binding n_SN in
+         * the ciphertext (paper eq. 10: AAD = n_SN || n_KPA || "auth_resp").
+         * SN verifies n_SN is echoed correctly.
+         */
+        recv_2( EG, SN,
+            tEG,
+            { tEG, nEG, nSN }k(SN,EG)
+        );
+
+        /*
+         * M3: pk(SN) || T_SN || mac( pk(SN), T_SN, K_psk )
+         * SN sends its ephemeral ML-KEM-512 public key with an HMAC
+         * integrity tag keyed under K_psk (paper eq. 3/11).
+         */
+        send_3( SN, EG,
+            pk(SN),
+            tSN,
+            mac( pk(SN), tSN, k(EG,SN) )
+        );
+
+        /*
+         * M4: { ss }_{pk(SN)} || T_EG || mac( { ss }_{pk(SN)}, T_EG, K_psk )
+         * EG returns a ciphertext encapsulating the fresh shared secret ss
+         * (paper eq. 4/12). SN decapsulates to recover ss, then (in the
+         * real protocol, not representable here) erases sk_SN -- see the
+         * forward-secrecy limitation noted above.
+         */
+        recv_4( EG, SN,
+            { ss }pk(SN),
+            tEG,
+            mac( { ss }pk(SN), tEG, k(EG,SN) )
+        );
+
+        /*
+         * M5: { T_SN, n_SN }_{sigma}
+         * Encrypted sensor telemetry under the derived session key sigma
+         * (paper eq. 6/14: sigma = HKDF(ss || n_KPA || T_EG || Q_SN, ...)).
+         * h(ss, k(EG,SN), tEG) stands in for that derivation, with K_psk
+         * as a stand-in for the long-term-bound input alongside ss/T_EG.
+         */
+        send_5( SN, EG,
+            { tSN, nSN }h( ss, k(EG,SN), tEG )
+        );
+
+        /* Security claims -- role SN */
+        claim( SN, Alive         );
+        claim( SN, Weakagree     );
+        claim( SN, Niagree       );
+        claim( SN, Nisynch       );
+        claim( SN, Secret, nSN   );
+        claim( SN, Secret, nEG   );
+        claim( SN, Secret, ss    );
+        claim( SN, Secret, h(ss, k(EG,SN), tEG) );
+    }
+
+    /*
+     * Role EG -- Edge Gateway (responder)
+     *
+     * Phase 1a: receives M1, verifies
+     * Phase 1b: sends M2
+     * Phase 2a: receives M3 (ML-KEM-512 public key), verifies HMAC
+     * Phase 2b: encapsulates ss, sends M4
+     * Phase 3:  derives sigma = h(ss, k(EG,SN), tEG)
+     * Phase 4:  receives M5, decrypts sensor telemetry
+     */
+    role EG
+    {
+        fresh nEG : Nonce;
+        fresh tEG : Nonce;
+        fresh ss  : Nonce;
+        var   nSN : Nonce;
+        var   tSN : Nonce;
+
+        /*
+         * M1: receive authentication request from SN
+         */
+        recv_1( SN, EG,
+            tSN,
+            { tSN, nSN }k(SN,EG)
+        );
+
+        /*
+         * M2: send authentication response, binding n_SN to rule out
+         * cross-session reflection attacks (paper Sec. 4.2).
+         */
+        send_2( EG, SN,
+            tEG,
+            { tEG, nEG, nSN }k(SN,EG)
+        );
+
+        /*
+         * M3: receive SN's ephemeral ML-KEM-512 public key, verify HMAC
+         */
+        recv_3( SN, EG,
+            pk(SN),
+            tSN,
+            mac( pk(SN), tSN, k(EG,SN) )
+        );
+
+        /*
+         * M4: encapsulate a fresh shared secret ss under SN's public key,
+         * send the ciphertext with an HMAC integrity tag.
+         */
+        send_4( EG, SN,
+            { ss }pk(SN),
+            tEG,
+            mac( { ss }pk(SN), tEG, k(EG,SN) )
+        );
+
+        /*
+         * M5: receive and decrypt sensor telemetry under sigma
+         */
+        recv_5( SN, EG,
+            { tSN, nSN }h( ss, k(EG,SN), tEG )
+        );
+
+        /* Security claims -- role EG */
+        claim( EG, Alive         );
+        claim( EG, Weakagree     );
+        claim( EG, Niagree       );
+        claim( EG, Nisynch       );
+        claim( EG, Secret, nEG   );
+        claim( EG, Secret, nSN   );
+        claim( EG, Secret, ss    );
+        claim( EG, Secret, h(ss, k(EG,SN), tEG) );
+    }
+}
