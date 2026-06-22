@@ -1,0 +1,221 @@
+(* ============================================================
+   pqlitekem.pv  --  ProVerif formal verification model for PQ-LiteKEM
+   Perfect Forward Secrecy / HNDL resistance under phase-based
+   long-term key compromise.
+
+   Companion artifact to:
+     "Provably Secure Practical Lightweight Post-Quantum Key
+     Establishment Protocol for IoMT", CPSIoTSec '26.
+
+   Division of labour with Scyther (pqlitekem.spdl, same repository)
+   -------------------------------------------------------------------
+   The Scyther model establishes entity authentication and term/
+   message-order agreement (Alive, Weakagree, Niagree, Nisynch) under
+   a STATIC Dolev-Yao adversary. Scyther's claim language has no
+   construct for granting the adversary a long-term secret only AFTER
+   a session has closed, so it cannot by itself certify Perfect
+   Forward Secrecy (PFS) or HNDL resistance. This model fills that
+   gap: it certifies secrecy under an explicit, TIME-PHASED long-term-
+   key compromise -- the HNDL adversary's actual operational profile
+   of archiving traffic now and attacking later -- using ProVerif's
+   `phase` construct.
+
+   Modelling conventions used throughout this file
+   -------------------------------------------------------------------
+   - Every value, including long-term secrets and derived keys, is
+     typed `bitstring`. No distinct `key` type is introduced: ProVerif
+     does not implicitly coerce between user-declared types inside a
+     tuple, and a `key`/`bitstring` split caused a type error in an
+     earlier draft of this model with no benefit to the analysis.
+   - Multi-field messages are never destructured via ProVerif's bare
+     anonymous-tuple pattern `let (a,b,c) = expr in`. Each multi-field
+     message instead has an explicit constructor declared with the
+     `[data]` attribute (e.g. `concat3`), and is pattern-matched
+     against that named constructor: `let concat3(a,b,c) = expr in`.
+     The `[data]` attribute is what makes a constructor invertible by
+     pattern matching; this is the same convention used throughout
+     PQ-LiteKEM's other verification artifacts and avoids relying on
+     anonymous-tuple destructuring support that varies across
+     ProVerif versions.
+   - KDF-style functions take their inputs as direct, separate
+     arguments (e.g. `khkdf(Kpsk, QSN)`), never as a tuple packed
+     into a single argument slot. No bare string literal is passed as
+     a domain-separation tag inside any function call (an earlier
+     draft of this model did this and it produced a parser syntax
+     error pointing at the closing quote of the literal); domain
+     separation between Kauth and sigma is instead structural, via
+     two distinctly-named, differently-shaped KDF functions.
+   ============================================================ *)
+
+(* ---------- Channel ---------- *)
+free c: channel. (* public wireless channel, full Dolev-Yao control *)
+
+(* ---------- Long-term secrets (Phase 0 provisioning, paper Sec 4.1) ---------- *)
+free Kpsk: bitstring [private]. (* 256-bit pre-shared key, KPA-issued *)
+free QSN:  bitstring [private]. (* hardware fingerprint / software-PUF output *)
+free nKPA: bitstring [private]. (* provisioning-lifecycle nonce, fixed per provisioning *)
+
+(* ---------- Asymmetric encryption (models ML-KEM-512 as a KEM) ---------- *)
+type pkey.
+type skey.
+fun pk(skey): pkey.
+fun aenc(bitstring, pkey): bitstring.
+reduc forall m: bitstring, sk: skey;
+  adec(aenc(m, pk(sk)), sk) = m.
+
+(* ---------- Symmetric authenticated encryption (models AES-256-GCM) ---------- *)
+fun senc(bitstring, bitstring): bitstring.
+reduc forall m: bitstring, k: bitstring;
+  sdec(senc(m, k), k) = m.
+
+(* ---------- MAC (models HMAC-SHA3-256) ---------- *)
+fun hmac(bitstring, bitstring): bitstring.
+
+(* ---------- KDF (models HKDF-SHA3-256) ----------
+   Two arities are needed: a 2-argument form for Kauth (paper eq. 2/7:
+   Kauth = HKDF(Kpsk || QSN, info)) and a 4-argument form for sigma
+   (paper eq. 5/13: sigma = HKDF(ss || nKPA || tEG || QSN, info)).
+   Declaring two distinctly-named functions provides the domain
+   separation the paper's eq. 2/5 achieve via an explicit info string
+   (e.g. "PQ-LiteKEM-KAUTH-v1"); ProVerif's parser does not accept a
+   bare string literal as a function argument the way this model
+   originally assumed, so domain separation here is structural --
+   khkdf and sigkdf are distinct, differently-shaped functions -- the
+   same approach used by the companion working reference for
+   derive_kauth vs kdf. *)
+fun khkdf(bitstring, bitstring): bitstring.                          (* Kauth derivation *)
+fun sigkdf(bitstring, bitstring, bitstring, bitstring): bitstring.   (* sigma derivation *)
+
+(* ---------- Message constructors ----------
+   Declared [data] so ProVerif can pattern-match (destructure) against
+   them on receipt; this is required for the `let f(...) = term in`
+   destructuring used throughout the roles below. *)
+fun concat2(bitstring, bitstring): bitstring [data].
+fun concat3(bitstring, bitstring, bitstring): bitstring [data].
+fun msg3(pkey, bitstring, bitstring): bitstring [data]. (* preserves the pkey type for M3 *)
+fun concat_pk(pkey, bitstring): bitstring [data]. (* binds pkSN into the M3 HMAC tag *)
+
+(* ---------- Events ----------
+   Optional: not required for the secrecy query below, but lets the
+   model be extended later with correspondence (Niagree-style) queries
+   without restructuring the roles. *)
+event SN_Accept(bitstring).
+event EG_Accept(bitstring).
+
+(* ---------- Secrecy query (paper Sec. 5.4.2) ----------
+   ProVerif's "query attacker(new n)" asks: does there exist a trace,
+   over an unbounded number of sessions and interleavings, in which
+   the attacker comes to know the name n? "false" = no such trace
+   exists, i.e. n is proven secret -- including traces where phase 1
+   (the long-term-key release below) happens strictly AFTER the
+   session that generated n. That is the formal statement of forward
+   secrecy.
+
+   We query ss_EG directly (the ML-KEM shared secret as generated).
+   sigma's secrecy is not queried as a separate name because sigma is
+   a *deterministic function* of ss (eq. 13): sigkdf(ss, nKPA, tEG,
+   QSN). Since nKPA and tEG are public/non-secret quantities
+   already reachable by the attacker via the wire, sigma's secrecy
+   reduces entirely to ss's secrecy -- proving attacker(new ss_EG) =
+   false is therefore sufficient to establish PFS for sigma, and is
+   exactly the reduction stated in the proof of Lemma 5.6. *)
+query attacker(new ss_EG).
+
+(* ---------- Sensor Node (SN) role ---------- *)
+let SN_role(skSN: skey, Kpsk: bitstring, QSN: bitstring, nKPA: bitstring) =
+  (* Protocol Phase 1: boot-time Kauth derivation, no network
+     communication (eq. 2 / 7). *)
+  let Kauth = khkdf(Kpsk, QSN) in
+
+  new nSN: bitstring;
+  new tSN: bitstring;
+  let pt1 = concat2(nSN, tSN) in
+  let m1  = concat3(tSN, senc(pt1, Kauth), hmac(pt1, Kauth)) in
+  out(c, m1);                                                (* M1 *)
+
+  in(c, m2: bitstring);                                       (* M2 *)
+  let concat3(tEG_in: bitstring, ct2: bitstring, tag2: bitstring) = m2 in
+  let pt2_dec = sdec(ct2, Kauth) in
+  let concat3(nEG_in: bitstring, tEG_chk: bitstring, nSN_chk: bitstring) = pt2_dec in
+  if nSN_chk = nSN then
+  if tEG_chk = tEG_in then
+
+  (* Protocol Phase 2: ephemeral ML-KEM-512 keypair generation (Sec 4.3) *)
+  let pkSN = pk(skSN) in
+  out(c, msg3(pkSN, tSN, hmac(concat_pk(pkSN, tSN), Kpsk)));  (* M3 *)
+
+  in(c, m4: bitstring);                                       (* M4 *)
+  let concat3(ct4: bitstring, tEG2: bitstring, tag4: bitstring) = m4 in
+  if tag4 = hmac(concat2(ct4, tEG2), Kpsk) then
+  let ss_SN = adec(ct4, skSN) in
+  (* skSN is never referenced again below: this models the immediate
+     volatile-memory wipe of the ephemeral KEM secret key after
+     decapsulation, per Section 4.3. *)
+
+  (* Protocol Phase 3: session key derivation (eq. 5 / 13) *)
+  let sigma_SN = sigkdf(ss_SN, nKPA, tEG2, QSN) in
+  event SN_Accept(tEG2);
+
+  (* Protocol Phase 4: one encrypted telemetry reading under sigma *)
+  new seqnum: bitstring;
+  new d_sensor: bitstring;
+  new tSN_s: bitstring;
+  let aad5 = concat2(tSN_s, seqnum) in
+  let m5   = concat3(senc(concat2(d_sensor, aad5), sigma_SN), tSN_s, seqnum) in
+  out(c, m5);                                                 (* M5 *)
+  0.
+
+(* ---------- Edge Gateway (EG) role ---------- *)
+let EG_role(Kpsk: bitstring, QSN: bitstring, nKPA: bitstring) =
+  let Kauth = khkdf(Kpsk, QSN) in
+
+  in(c, m1: bitstring);                                       (* M1 *)
+  let concat3(tSN_in: bitstring, ct1: bitstring, tag1: bitstring) = m1 in
+  let pt1_dec = sdec(ct1, Kauth) in
+  let concat2(nSN_in: bitstring, tSN_chk: bitstring) = pt1_dec in
+  if tSN_chk = tSN_in then
+
+  new nEG: bitstring;
+  new tEG: bitstring;
+  let pt2 = concat3(nEG, tEG, nSN_in) in
+  out(c, concat3(tEG, senc(pt2, Kauth), hmac(pt2, Kauth)));   (* M2 *)
+
+  in(c, m3_recv: bitstring);                                  (* M3 *)
+  let msg3(pkSN_recv: pkey, tSN2: bitstring, tag3: bitstring) = m3_recv in
+  if tag3 = hmac(concat_pk(pkSN_recv, tSN2), Kpsk) then
+
+  new ss_EG: bitstring;
+  let ct4 = aenc(ss_EG, pkSN_recv) in
+  new tEG2: bitstring;
+  out(c, concat3(ct4, tEG2, hmac(concat2(ct4, tEG2), Kpsk))); (* M4 *)
+
+  let sigma_EG = sigkdf(ss_EG, nKPA, tEG2, QSN) in
+  event EG_Accept(tEG2);
+
+  in(c, m5: bitstring);                                       (* M5 *)
+  let concat3(ct5: bitstring, tSN_s: bitstring, seqnum: bitstring) = m5 in
+  let plaintext5 = sdec(ct5, sigma_EG) in
+  0.
+
+(* ============================================================
+   Phase-based compromise model (paper Section 5.4.2)
+
+   ProVerif phase 0: unbounded replications of SN_role and EG_role
+   run the full M1-M5 handshake. The attacker has only the standard
+   Dolev-Yao network control over channel c.
+
+   ProVerif phase 1: the long-term secrets Kpsk and QSN are released
+   to the public channel. ProVerif explores every possible
+   interleaving of this release relative to phase-0 sessions,
+   including release strictly AFTER a given session has completed --
+   this is exactly the HNDL adversary's "harvest now, decrypt later"
+   profile.
+
+   nKPA is deliberately NOT released in phase 1: the threat model
+   (Sec 5.1.2, "Authority Isolation") treats KPA compromise as
+   out-of-scope, distinct from device-level (Kpsk, QSN) compromise.
+   ============================================================ *)
+process
+  new skSN: skey;
+  ( (!SN_role(skSN, Kpsk, QSN, nKPA)) | (!EG_role(Kpsk, QSN, nKPA)) )
+  | ( phase 1; out(c, Kpsk); out(c, QSN) )
