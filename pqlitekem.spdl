@@ -2,7 +2,7 @@
  * pqlitekem.spdl  --  Scyther formal verification model for PQ-LiteKEM
  *
  * Protocol: PQ-LiteKEM (channel-agnostic post-quantum key establishment)
- * Roles:    SN -- Constrained Sensor Node  (e.g. LilyGo T-Watch S3, BLE peripheral)
+ * Roles:    MSN -- Constrained Medical Sensor Node  (e.g. LilyGo T-Watch S3, BLE peripheral)
  *           EG -- Edge Gateway             (e.g. Raspberry Pi, BLE central)
  *
  * Companion artifact to:
@@ -19,7 +19,7 @@
  * closed, so it cannot by itself certify Perfect Forward Secrecy (PFS) or
  * HNDL resistance. That separate, time-phased guarantee is established in
  * the companion ProVerif model via an explicit `phase` compromise of
- * K_psk and Q_SN. Read the `claim(..., Secret, ...)` results below as
+ * K_psk and Q_MSN. Read the `claim(..., Secret, ...)` results below as
  * "secret under a non-compromised long-term key", not as a PFS proof.
  *
  * Modelling decisions
@@ -32,24 +32,24 @@
  *    hand the intruder a free long-term key as initial knowledge. Both
  *    secrets are therefore modelled via the same trusted built-in
  *    `k(A,B)` family, distinguished by swapping the agent argument order:
- *        k(SN,EG)  -- stands in for K_auth (Phase-1 AEAD exchange)
- *        k(EG,SN)  -- stands in for K_psk  (Phase-2 HMAC tags, sigma)
+ *        k(MSN,EG)  -- stands in for K_auth (Phase-1 AEAD exchange)
+ *        k(EG,MSN)  -- stands in for K_psk  (Phase-2 HMAC tags, sigma)
  *    Scyther does not assume `k` is commutative, so these are two
- *    genuinely distinct secrets, each implicitly known only to {SN,EG}.
+ *    genuinely distinct secrets, each implicitly known only to {MSN,EG}.
  *
- * 2. ML-KEM-512 is modelled as asymmetric encryption: { ss }pk(SN)
- *      Encapsulate(pk_SN) -> (ct, ss)   modelled as   { ss }pk(SN)
- *      Decapsulate(sk_SN, ct) -> ss     modelled as   decryption of { ss }pk(SN)
+ * 2. ML-KEM-512 is modelled as asymmetric encryption: { ss }pk(MSN)
+ *      Encapsulate(pk_MSN) -> (ct, ss)   modelled as   { ss }pk(MSN)
+ *      Decapsulate(sk_MSN, ct) -> ss     modelled as   decryption of { ss }pk(MSN)
  *    This is the standard KEM-as-asymmetric-encryption abstraction under
  *    the perfect cryptography assumption (paper Sec. 5.4.1).
  *
  *    LIMITATION: Scyther's pk()/sk() convention ties a keypair to an
  *    agent's long-term identity, not to a fresh per-session value. The
- *    real protocol generates (pk_SN, sk_SN) AFRESH every session
- *    (paper Sec. 4.3) and erases sk_SN immediately after decapsulation,
+ *    real protocol generates (pk_MSN, sk_MSN) AFRESH every session
+ *    (paper Sec. 4.3) and erases sk_MSN immediately after decapsulation,
  *    which is exactly what gives PQ-LiteKEM forward secrecy -- but that
- *    session-freshness is not representable in Scyther's fixed pk(SN)/
- *    sk(SN) pair. This is a known, accepted simplification when modelling
+ *    session-freshness is not representable in Scyther's fixed pk(MSN)/
+ *    sk(MSN) pair. This is a known, accepted simplification when modelling
  *    ephemeral KEMs in Scyther; it is the reason PFS is verified
  *    separately in ProVerif rather than claimed from this model.
  *
@@ -58,98 +58,98 @@
  * 4. HMAC-SHA3-256 is modelled as a keyed hash: mac(m, k)
  *
  * 5. HKDF-SHA3-256 session-key derivation (sigma, paper eq. 5/13) is
- *    modelled as a keyed hash: h(ss, k(EG,SN), tEG)
+ *    modelled as a keyed hash: h(ss, k(EG,MSN), tEG)
  */
 
 hashfunction h;
 hashfunction mac;
 
-protocol PQLiteKEM(SN, EG)
+protocol PQLiteKEM(MSN, EG)
 {
     /*
-     * Role SN -- Constrained Sensor Node (initiator)
+     * Role MSN -- Constrained Medical Sensor Node (initiator)
      *
      * Phase 1a: sends M1 (auth request)
      * Phase 1b: receives M2 (auth response), verifies
      * Phase 2a: sends M3 (ephemeral ML-KEM-512 public key)
      * Phase 2b: receives M4 (ML-KEM-512 ciphertext), decapsulates -> ss
-     * Phase 3:  derives sigma = h(ss, k(EG,SN), tEG)
+     * Phase 3:  derives sigma = h(ss, k(EG,MSN), tEG)
      * Phase 4:  sends M5 (encrypted sensor telemetry under sigma)
      */
-    role SN
+    role MSN
     {
-        fresh nSN : Nonce;
-        fresh tSN : Nonce;
+        fresh nMSN : Nonce;
+        fresh tMSN : Nonce;
         var   nEG : Nonce;
         var   tEG : Nonce;
         var   ss  : Nonce;
 
         /*
-         * M1: T_SN || { T_SN, n_SN }_{K_auth}
-         * SN sends its nonce + canary timestamp encrypted under K_auth.
-         * T_SN also appears in clear (used as part of the GCM IV in the
+         * M1: T_MSN || { T_MSN, n_MSN }_{K_auth}
+         * MSN sends its nonce + canary timestamp encrypted under K_auth.
+         * T_MSN also appears in clear (used as part of the GCM IV in the
          * real protocol; paper eq. 9).
          */
-        send_1( SN, EG,
-            tSN,
-            { tSN, nSN }k(SN,EG)
+        send_1( MSN, EG,
+            tMSN,
+            { tMSN, nMSN }k(MSN,EG)
         );
 
         /*
-         * M2: T_EG || { T_EG, n_EG, n_SN }_{K_auth}
-         * EG responds with its own nonce + timestamp, binding n_SN in
-         * the ciphertext (paper eq. 10: AAD = n_SN || n_KPA || "auth_resp").
-         * SN verifies n_SN is echoed correctly.
+         * M2: T_EG || { T_EG, n_EG, n_MSN }_{K_auth}
+         * EG responds with its own nonce + timestamp, binding n_MSN in
+         * the ciphertext (paper eq. 10: AAD = n_MSN || n_KPA || "auth_resp").
+         * MSN verifies n_MSN is echoed correctly.
          */
-        recv_2( EG, SN,
+        recv_2( EG, MSN,
             tEG,
-            { tEG, nEG, nSN }k(SN,EG)
+            { tEG, nEG, nMSN }k(MSN,EG)
         );
 
         /*
-         * M3: pk(SN) || T_SN || mac( pk(SN), T_SN, K_psk )
-         * SN sends its ephemeral ML-KEM-512 public key with an HMAC
+         * M3: pk(MSN) || T_MSN || mac( pk(MSN), T_MSN, K_psk )
+         * MSN sends its ephemeral ML-KEM-512 public key with an HMAC
          * integrity tag keyed under K_psk (paper eq. 3/11).
          */
-        send_3( SN, EG,
-            pk(SN),
-            tSN,
-            mac( pk(SN), tSN, k(EG,SN) )
+        send_3( MSN, EG,
+            pk(MSN),
+            tMSN,
+            mac( pk(MSN), tMSN, k(EG,MSN) )
         );
 
         /*
-         * M4: { ss }_{pk(SN)} || T_EG || mac( { ss }_{pk(SN)}, T_EG, K_psk )
+         * M4: { ss }_{pk(MSN)} || T_EG || mac( { ss }_{pk(MSN)}, T_EG, K_psk )
          * EG returns a ciphertext encapsulating the fresh shared secret ss
-         * (paper eq. 4/12). SN decapsulates to recover ss, then (in the
-         * real protocol, not representable here) erases sk_SN -- see the
+         * (paper eq. 4/12). MSN decapsulates to recover ss, then (in the
+         * real protocol, not representable here) erases sk_MSN -- see the
          * forward-secrecy limitation noted above.
          */
-        recv_4( EG, SN,
-            { ss }pk(SN),
+        recv_4( EG, MSN,
+            { ss }pk(MSN),
             tEG,
-            mac( { ss }pk(SN), tEG, k(EG,SN) )
+            mac( { ss }pk(MSN), tEG, k(EG,MSN) )
         );
 
         /*
-         * M5: { T_SN, n_SN }_{sigma}
+         * M5: { T_MSN, n_MSN }_{sigma}
          * Encrypted sensor telemetry under the derived session key sigma
-         * (paper eq. 6/14: sigma = HKDF(ss || n_KPA || T_EG || Q_SN, ...)).
-         * h(ss, k(EG,SN), tEG) stands in for that derivation, with K_psk
+         * (paper eq. 6/14: sigma = HKDF(ss || n_KPA || T_EG || Q_MSN, ...)).
+         * h(ss, k(EG,MSN), tEG) stands in for that derivation, with K_psk
          * as a stand-in for the long-term-bound input alongside ss/T_EG.
          */
-        send_5( SN, EG,
-            { tSN, nSN }h( ss, k(EG,SN), tEG )
+        send_5( MSN, EG,
+            { tMSN, nMSN }h( ss, k(EG,MSN), tEG )
         );
 
-        /* Security claims -- role SN */
-        claim( SN, Alive         );
-        claim( SN, Weakagree     );
-        claim( SN, Niagree       );
-        claim( SN, Nisynch       );
-        claim( SN, Secret, nSN   );
-        claim( SN, Secret, nEG   );
-        claim( SN, Secret, ss    );
-        claim( SN, Secret, h(ss, k(EG,SN), tEG) );
+        /* Security claims -- role MSN */
+        claim( MSN, Alive         );
+        claim( MSN, Weakagree     );
+        claim( MSN, Niagree       );
+        claim( MSN, Nisynch       );
+        claim( MSN, Secret, nMSN   );
+        claim( MSN, Secret, nEG   );
+        claim( MSN, Secret, ss    );
+        claim( MSN, Secret, h(ss, k(EG,MSN), tEG) );
     }
 
     /*
@@ -159,7 +159,7 @@ protocol PQLiteKEM(SN, EG)
      * Phase 1b: sends M2
      * Phase 2a: receives M3 (ML-KEM-512 public key), verifies HMAC
      * Phase 2b: encapsulates ss, sends M4
-     * Phase 3:  derives sigma = h(ss, k(EG,SN), tEG)
+     * Phase 3:  derives sigma = h(ss, k(EG,MSN), tEG)
      * Phase 4:  receives M5, decrypts sensor telemetry
      */
     role EG
@@ -167,50 +167,50 @@ protocol PQLiteKEM(SN, EG)
         fresh nEG : Nonce;
         fresh tEG : Nonce;
         fresh ss  : Nonce;
-        var   nSN : Nonce;
-        var   tSN : Nonce;
+        var   nMSN : Nonce;
+        var   tMSN : Nonce;
 
         /*
-         * M1: receive authentication request from SN
+         * M1: receive authentication request from MSN
          */
-        recv_1( SN, EG,
-            tSN,
-            { tSN, nSN }k(SN,EG)
+        recv_1( MSN, EG,
+            tMSN,
+            { tMSN, nMSN }k(MSN,EG)
         );
 
         /*
-         * M2: send authentication response, binding n_SN to rule out
+         * M2: send authentication response, binding n_MSN to rule out
          * cross-session reflection attacks (paper Sec. 4.2).
          */
-        send_2( EG, SN,
+        send_2( EG, MSN,
             tEG,
-            { tEG, nEG, nSN }k(SN,EG)
+            { tEG, nEG, nMSN }k(MSN,EG)
         );
 
         /*
-         * M3: receive SN's ephemeral ML-KEM-512 public key, verify HMAC
+         * M3: receive MSN's ephemeral ML-KEM-512 public key, verify HMAC
          */
-        recv_3( SN, EG,
-            pk(SN),
-            tSN,
-            mac( pk(SN), tSN, k(EG,SN) )
+        recv_3( MSN, EG,
+            pk(MSN),
+            tMSN,
+            mac( pk(MSN), tMSN, k(EG,MSN) )
         );
 
         /*
-         * M4: encapsulate a fresh shared secret ss under SN's public key,
+         * M4: encapsulate a fresh shared secret ss under MSN's public key,
          * send the ciphertext with an HMAC integrity tag.
          */
-        send_4( EG, SN,
-            { ss }pk(SN),
+        send_4( EG, MSN,
+            { ss }pk(MSN),
             tEG,
-            mac( { ss }pk(SN), tEG, k(EG,SN) )
+            mac( { ss }pk(MSN), tEG, k(EG,MSN) )
         );
 
         /*
          * M5: receive and decrypt sensor telemetry under sigma
          */
-        recv_5( SN, EG,
-            { tSN, nSN }h( ss, k(EG,SN), tEG )
+        recv_5( MSN, EG,
+            { tMSN, nMSN }h( ss, k(EG,MSN), tEG )
         );
 
         /* Security claims -- role EG */
@@ -219,8 +219,8 @@ protocol PQLiteKEM(SN, EG)
         claim( EG, Niagree       );
         claim( EG, Nisynch       );
         claim( EG, Secret, nEG   );
-        claim( EG, Secret, nSN   );
+        claim( EG, Secret, nMSN   );
         claim( EG, Secret, ss    );
-        claim( EG, Secret, h(ss, k(EG,SN), tEG) );
+        claim( EG, Secret, h(ss, k(EG,MSN), tEG) );
     }
 }
